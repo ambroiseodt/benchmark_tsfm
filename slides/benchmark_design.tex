@@ -1,0 +1,462 @@
+\documentclass{beamer}
+
+\usepackage{beamer_tom}
+\usepackage{listings}
+\graphicspath{{./images/}}
+
+\lstdefinestyle{python}{
+    language=Python,
+    basicstyle=\ttfamily\footnotesize,
+    keywordstyle=\color{blue!80!black},
+    commentstyle=\color{gray},
+    stringstyle=\color{orange!80!black},
+    showstringspaces=false,
+    breaklines=true,
+    frame=none,
+}
+\lstset{style=python}
+\definecolor{oneblue}{RGB}{0,0,255}
+
+\institute{INRIA Saclay}
+\author{Thomas Moreau}
+\collaborators[none]{}
+\title{%
+    Evaluating Time-Series Foundation Models\\
+    Benchmark Design Choices
+}
+
+\setbeamertemplate{title page}[frame]
+\def\extraLogo{}
+
+\begin{document}
+
+%% =========================================================
+\begin{frame}
+    \titlepage
+\end{frame}
+
+%% =========================================================
+\section{Context \& Goals}
+
+\begin{frame}{Time-series foundation models are multiplying fast}
+
+    Large pretrained models for time-series have emerged in the last two years:
+    \begin{columns}
+        \column{.5\textwidth}
+        \begin{itemize}
+            \item Chronos (Amazon, 2024)
+            \item TimesFM (Google, 2024)
+            \item Moirai (Salesforce, 2024)
+        \end{itemize}
+        \column{.5\textwidth}
+        \begin{itemize}
+            \item Mantis, MOMENT, \ldots
+            \item Diverse architectures
+            \item Very different evaluation protocols
+        \end{itemize}
+    \end{columns}
+    \vskip1em
+
+    These models can, in principle, tackle \textbf{multiple tasks}:
+    \begin{itemize}
+        \item \textbf{Forecasting} --- often their primary objective
+        \item \textbf{Classification} --- via embeddings + linear probe
+        \item \textbf{Anomaly detection} --- via residuals or embeddings
+    \end{itemize}
+
+    \strongpoint{No cross-task evaluation exists; adaptation strategies are not compared}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Sprint goal: one benchmark, three tasks}
+
+    We want a single framework that answers:
+    \begin{center}
+        \textit{Which model, with which adaptation, wins on which task?}
+    \end{center}
+    \vskip.5em
+
+    Design requirements:
+    \begin{itemize}
+        \item One \texttt{benchopt run} produces results across all three tasks
+        \item Adding a new model = writing \textbf{one solver file}
+        \item Shared adaptation code (linear probe, fine-tuning, windowing, \ldots)
+        \item Simple, numpy-based data interface --- no framework lock-in
+        \item Results aggregated into a single report
+    \end{itemize}
+
+    \vskip.5em
+    \begin{block}{Non-goal}
+        Beating task-specific SOTA.
+        The goal is \emph{comparison across models and adaptation strategies}.
+    \end{block}
+
+\end{frame}
+
+%% =========================================================
+\section{Design Propositions}
+\parttitleframe{}
+
+\begin{frame}{Proposition 1 --- unified vs.\ three separate benchmarks}
+
+    \textbf{Option B}: three independent benchopt benchmarks
+    \begin{itemize}
+        \item[\color{green!60!black}$+$] Clean task separation, independent runs
+        \item[\color{red}$-$] Solver code duplicated across three directories
+        \item[\color{red}$-$] Three result files; cross-task comparison is manual
+        \item[\color{red}$-$] Newcomers must learn three benchmark layouts
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Option A}: single benchmark, task dispatched by dataset
+    \begin{itemize}
+        \item[\color{green!60!black}$+$] One directory, one report, one command
+        \item[\color{green!60!black}$+$] Dataset declares its task and metrics
+        \item[\color{green!60!black}$+$] Solver declares which tasks it supports (\texttt{skip()})
+        \item[\color{red}$-$] Objective must dispatch three evaluation protocols
+    \end{itemize}
+
+    \strongpoint{Lean toward option A}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Proposition 2 --- solver returns predictions vs.\ a model}
+
+    \textbf{Solver returns predictions} (classic benchopt pattern):
+    \begin{itemize}
+        \item[\color{green!60!black}$+$] No need to be able to interact with the model
+        \item[\color{red}$-$] Each solver re-implements rolling window evaluation
+        \item[\color{red}$-$] Risk of inconsistent evaluation across models
+        \item[\color{red}$-$] Test data must be exposed to the solver
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Solver returns a fitted model with \texttt{predict()}}:
+    \begin{itemize}
+        \item[\color{green!60!black}$+$] Objective controls the full evaluation loop
+        \item[\color{green!60!black}$+$] Rolling window evaluation is consistent for all models
+        \item[\color{green!60!black}$+$] Solver only needs to fit/adapt --- predict is trivially standardized
+        \item[\color{green!60!black}$+$] \texttt{benchmark\_utils/adapters/} is a reusable adaptation library
+    \end{itemize}
+
+    \strongpoint{Solver.get\_result() returns \{"model": adapter\} where adapter.predict(x) is called by the objective}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Proposition 3 --- data representation}
+
+    Fixed \texttt{(N, T, C)} arrays force a single context length on all models.\\
+    Foundation models vary greatly in supported context:
+    Chronos handles up to 512 steps; some models take 8192.
+
+    \vskip.5em
+    \textbf{Chosen interface}: \textbf{list of \texttt{(T\textsubscript{i}, C)} numpy arrays}
+    \begin{itemize}
+        \item Variable length per sample --- model truncates/pads internally
+        \item Dataset creates rolling-window contexts as full growing histories
+        \item No framework dependency (plain numpy, converts to torch inside model)
+        \item Consistent shape rule across all three tasks
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Why not pandas?}  A \texttt{DataFrame} with \texttt{MultiIndex(id, time)} would carry
+    freq information naturally, but it adds cognitive overhead for contributors.
+    Could pass frequency in a \texttt{meta} dict instead.
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Task data contracts}
+
+    All datasets return the same keys; shapes differ per task.
+
+    \vskip.5em
+    \begin{center}
+    \begin{tabular}{lccc}
+        \toprule
+        & \textbf{Forecasting} & \textbf{Classification} & \textbf{Anomaly det.} \\
+        \midrule
+        \texttt{X\_train} & \texttt{List[(T,C)]} & \texttt{List[(T,C)]} & \texttt{List[(T,C)]} \\
+        \texttt{y\_train} & \texttt{List[(H,C)]} & \texttt{(N,) int} & \texttt{None} \\
+        \texttt{X\_test}  & \texttt{List[(T\textsubscript{ctx},C)]} & \texttt{List[(T,C)]} & \texttt{List[(T,C)]} \\
+        \texttt{y\_test}  & \texttt{List[(H,C)]} & \texttt{(M,) int} & \texttt{List[(T,)} \\
+        \midrule
+        \texttt{task}     & \texttt{"forecasting"} & \texttt{"classification"} & \texttt{"anomaly\_detection"} \\
+        \texttt{metrics}  & \texttt{["mae","mase",...]} & \texttt{["accuracy",...]} & \texttt{["auc\_roc",...]} \\
+        \bottomrule
+    \end{tabular}
+    \end{center}
+
+    \vskip.5em
+    \keypoint{y\_test for AD is point-level binary (one label per timestep)}
+
+    \texttt{X\_test} for forecasting contains \emph{full growing contexts} --- the
+    dataset generates rolling windows; each entry is all history up to the
+    prediction point.
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}[fragile]{The predict() interface}
+
+    A single abstract interface for all adaptation strategies:
+
+    \begin{lstlisting}
+class BaseTSFMAdapter:
+    def fit(self, X_train, y_train, **kwargs):
+        return self  # optional, default no-op
+
+    def predict(self, x: np.ndarray) -> np.ndarray:
+        ...  # subclasses must implement
+    \end{lstlisting}
+
+    \vskip.5em
+    \textbf{Task-specific output of predict(x: (T, C))}:
+    \begin{itemize}
+        \item Forecasting: \texttt{(H, C)} predicted values
+        \item Classification: \texttt{int} label
+        \item Anomaly detection: \texttt{(T,)} float scores, one per timestep
+    \end{itemize}
+
+    \vskip.5em
+    The objective calls \texttt{adapter.predict(x)} for each test sample
+    in its \texttt{evaluate\_result()} --- the solver never sees the test labels.
+
+\end{frame}
+
+%% =========================================================
+\section{Implementation}
+
+\begin{frame}[fragile]{Unified objective --- task dispatch}
+
+    \begin{lstlisting}
+class Objective(BaseObjective):
+    requirements = ["scikit-learn", "aeon"]  # shared by all solvers
+
+    def set_data(self, X_train, y_train, X_test, y_test,
+                 task, metrics, **meta):
+        self.task, self.metrics = task, metrics
+        ...
+
+    def evaluate_result(self, model):  # model = adapter from solver
+        if self.task == "forecasting":
+            preds = [model.predict(x) for x, _ in zip(self.X_test, ...)]
+        elif self.task == "classification":
+            preds = [model.predict(x) for x in self.X_test]
+        elif self.task == "anomaly_detection":
+            preds = [model.predict(x) for x in self.X_test]
+        return {m: METRICS[m](self.y_test, preds) for m in self.metrics}
+    \end{lstlisting}
+
+    \keypoint{Rolling window loop lives here, not in the solver}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}[fragile]{Solver structure --- model $\times$ adaptation}
+
+    Filename convention encodes both: \texttt{chronos\_linear\_probe.py}
+
+    \begin{lstlisting}
+class Solver(BaseSolver):
+    name = "Chronos"
+    supported_tasks = ["forecasting", "anomaly_detection"]
+
+    def skip(self, task, **kwargs):
+        if task not in self.supported_tasks:
+            return True, f"not implemented for {task}"
+        return False, None
+
+    def set_objective(self, X_train, y_train, task, **meta):
+        self.model = load_chronos(self.size)   # untimed: model download
+        self.X_train, self.task, self.meta = X_train, task, meta
+
+    def run(self, _):                          # TIMED: adaptation
+        forecaster = ChronosForecaster(self.model, self.meta)
+        if self.task == "forecasting":
+            self._adapter = forecaster
+        elif self.task == "anomaly_detection":
+            self._adapter = ForecastResidualAdapter(forecaster)
+
+    def get_result(self):
+        return {"model": self._adapter}
+    \end{lstlisting}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Adaptation strategies in benchmark\_utils}
+
+    The \texttt{benchmark\_utils/adapters/} directory is a shared library of
+    adaptation strategies, reusable across solvers and tasks:
+
+    \vskip.5em
+    \begin{columns}[T]
+        \column{.5\textwidth}
+        \textbf{Zero-shot}
+        \begin{itemize}
+            \item Model's native forecast API
+            \item No fitting required
+            \item \texttt{run()} is near-instantaneous
+        \end{itemize}
+
+        \vskip.5em
+        \textbf{Linear probe}
+        \begin{itemize}
+            \item Frozen encoder + LogisticRegression
+            \item Fitted in \texttt{run()} on embeddings
+            \item Works for classification \& AD
+        \end{itemize}
+
+        \column{.5\textwidth}
+        \textbf{Forecast residual (AD)}
+        \begin{itemize}
+            \item Score $=$ forecast error at each step
+            \item Zero-shot anomaly detection
+            \item Reuses any forecasting adapter
+        \end{itemize}
+
+        \vskip.5em
+        \textbf{To add: LoRA / fine-tuning}
+        \begin{itemize}
+            \item PEFT-based adaptation
+            \item Fitting in \texttt{run()}
+            \item Solver parameter: \texttt{n\_epochs}
+        \end{itemize}
+    \end{columns}
+
+    \strongpoint{Same adaptation code across multiple solver files}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Repository layout}
+
+    \begin{center}
+    \ttfamily\footnotesize
+    \begin{tabular}{ll}
+        \texttt{objective.py} & unified objective, task dispatch \\
+        \texttt{benchmark\_utils/} & shared library \\
+        \quad\texttt{adapters} & Helpers to adapt a model to a task \\
+        \quad\texttt{metrics.py} & aeon + sklearn wrappers \\
+        \quad\texttt{windowing.py} & rolling-window context builder \\
+        \texttt{datasets/} & Task definition \\
+        \quad\texttt{ecg.py} & anomaly detection (TSB-UAD) \\
+        \quad\texttt{ucr.py} & classification (UCR archive) \\
+        \quad\texttt{monash.py} & forecasting (Monash archive) \\
+        \texttt{solvers/} & seasonal naive / majority / constant \\
+        \quad\texttt{naive.py} & seasonal naive / majority / constant \\
+        \quad\texttt{chronos.py} & Chronos zero-shot + AD \\
+    \end{tabular}
+    \end{center}
+
+    \vskip.5em
+    \keypoint{benchmark\_utils is auto-importable in all solver/dataset files}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}[fragile]{Adding a new model --- 3 steps}
+
+    \textbf{Step 1}: Prepare the model for the vairous tasks:
+
+    \myitem{} model wrapper in \texttt{benchmark\_utils/models/mymodel.py}
+    \begin{lstlisting}
+class MyModel:
+    def __init__(self, checkpoint): ...       # load weights
+
+    def encode(self, x: np.ndarray) -> np.ndarray:  # (T,C)->(D,)
+        ...
+    def forecast(self, x, prediction_length): # (T,C)->(H,C)
+        ...
+    \end{lstlisting}
+\end{frame}
+
+    \myitem {Or direct adapation from your favorite library, or with the furnished adapaters.}
+
+
+\begin{frame}[fragile]{Adding a new model --- 3 steps (2/2)}
+    \textbf{Step 2}: solver in \texttt{solvers/mymodel\_linear\_probe.py}
+    \begin{lstlisting}
+class Solver(BaseSolver):
+    name = "MyModel-LinearProbe"
+    supported_tasks = ["classification", "anomaly_detection"]
+
+    def run(self, _):
+        model = MyModel(self.checkpoint)
+        self._adapter = LinearProbeAdapter(model, task=self.task)
+        self._adapter.fit(self.X_train, self.y_train)
+    \end{lstlisting}
+
+    \textbf{Step 3}: validate with \texttt{benchopt test .}
+
+\end{frame}
+
+%% =========================================================
+\section{Open Questions}
+
+\begin{frame}{Open design questions --- discussion}
+
+    \textbf{Evaluation protocol}
+    \begin{itemize}
+        \item Forecasting: how many rolling windows per series? fixed stride?
+        \item AD: window-level vs.\ point-level scores for PA-F1?
+        \item Should fine-tuning be timed separately from inference?
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Datasets}
+    \begin{itemize}
+        \item Which Monash datasets are representative for TSFMs?
+        \item Add multivariate datasets for all tasks?
+        \item Shared datasets across tasks (same series, different annotation)?
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Adaptation strategies to prioritize}
+    \begin{itemize}
+        \item LoRA vs.\ full fine-tuning vs.\ head-only?
+        \item Prompt tuning for classification?
+        \item How to make AD adaptation strategies more principled?
+    \end{itemize}
+
+    \strongpoint{Goal of the sprint: fill these in and generate the first results}
+
+\end{frame}
+
+%% =========================================================
+\begin{frame}{Sprint plan}
+
+    \textbf{Morning: setup}
+    \begin{itemize}
+        \item \texttt{pip install benchopt \&\& benchopt install .}
+        \item Run the skeleton: \texttt{benchopt run . -d ECG -s Naive}
+        \item Pick a task / model / adaptation to implement
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{Afternoon: hacking}
+    \begin{itemize}
+        \item Add a model wrapper (\texttt{benchmark\_utils/models/})
+        \item Write a solver (\texttt{solvers/mymodel\_<adaptation>.py})
+        \item Add a dataset or extend an existing one
+        \item Add a new adaptation strategy to \texttt{benchmark\_utils/adapters/}
+    \end{itemize}
+
+    \vskip.5em
+    \textbf{End of day: compare \& discuss}
+    \begin{itemize}
+        \item Aggregate results with \texttt{benchopt plot}
+        \item Cross-task leaderboard: which model generalizes best?
+    \end{itemize}
+
+    {\vskip.5em\centering
+        \highlight{Repo: \texttt{github.com/benchopt/benchmark\_tsfm}}\\
+    }
+
+\end{frame}
+
+\end{document}
